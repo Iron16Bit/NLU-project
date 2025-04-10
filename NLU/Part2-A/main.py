@@ -27,55 +27,78 @@ out_slot = len(lang.slot2id)
 out_int = len(lang.intent2id)
 vocab_len = len(lang.word2id)
 
+# Store information about all runs
+all_losses_train = []
+all_losses_dev = []
+all_sampled_epochs = []
+
 slot_f1s, intent_acc = [], []
-for x in tqdm(range(0, runs)):
-    model = ModelIAS(hid_size, out_slot, out_int, emb_size, 
-                        vocab_len, pad_index=PAD_TOKEN).to(device)
+
+# Train
+for run in tqdm(range(0, runs)):
+    model = ModelIAS(hid_size, out_slot, out_int, emb_size, vocab_len, pad_index=PAD_TOKEN).to(device)
     model.apply(init_weights)
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion_slots = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
     criterion_intents = nn.CrossEntropyLoss()
-    
 
     patience = 3
     losses_train = []
     losses_dev = []
     sampled_epochs = []
     best_f1 = 0
-    for x in range(1,n_epochs):
-        loss = train_loop(train_loader, optimizer, criterion_slots, 
-                            criterion_intents, model)
-        if x % 5 == 0:
-            sampled_epochs.append(x)
-            losses_train.append(np.asarray(loss).mean())
-            results_dev, intent_res, loss_dev = eval_loop(dev_loader, criterion_slots, 
-                                                            criterion_intents, model, lang)
-            losses_dev.append(np.asarray(loss_dev).mean())
-            f1 = results_dev['total']['f']
 
+    for epoch in range(1, n_epochs):
+        loss = train_loop(train_loader, optimizer, criterion_slots, criterion_intents, model)
+        
+        if epoch % 5 == 0:
+            sampled_epochs.append(epoch)
+            losses_train.append(np.asarray(loss).mean())
+
+            results_dev, intent_res, loss_dev = eval_loop(dev_loader, criterion_slots, criterion_intents, model, lang)
+            losses_dev.append(np.asarray(loss_dev).mean())
+
+            f1 = results_dev['total']['f']
             if f1 > best_f1:
                 best_f1 = f1
             else:
                 patience -= 1
-            if patience <= 0: # Early stopping with patient
-                break # Not nice but it keeps the code clean
+            if patience <= 0:
+                break
 
-    results_test, intent_test, _ = eval_loop(test_loader, criterion_slots, 
-                                                criterion_intents, model, lang)
+    all_losses_train.append(losses_train)
+    all_losses_dev.append(losses_dev)
+    all_sampled_epochs.append(sampled_epochs)
+
+    results_test, intent_test, _ = eval_loop(test_loader, criterion_slots, criterion_intents, model, lang)
     intent_acc.append(intent_test['accuracy'])
     slot_f1s.append(results_test['total']['f'])
+
+# Print mean F1 score and intent accuracy across all runs
 slot_f1s = np.asarray(slot_f1s)
 intent_acc = np.asarray(intent_acc)
-print('Slot F1', round(slot_f1s.mean(),3), '+-', round(slot_f1s.std(),3))
-print('Intent Acc', round(intent_acc.mean(), 3), '+-', round(slot_f1s.std(), 3))
+print('Slot F1', round(slot_f1s.mean(), 3), '+-', round(slot_f1s.std(), 3))
+print('Intent Acc', round(intent_acc.mean(), 3), '+-', round(intent_acc.std(), 3))
 
-# Plot of the train and valid losses. TODO fix
-plt.figure(num = 3, figsize=(8, 5)).patch.set_facecolor('white')
-plt.title('Train and Dev Losses')
+# Find the common set of sampled epochs (min length)
+min_len = min(len(x) for x in all_sampled_epochs)
+trimmed_epochs = all_sampled_epochs[0][:min_len]  # Use epoch points from first run (trimmed)
+
+# Trim all to same length and compute mean across runs
+all_losses_train = np.array([run[:min_len] for run in all_losses_train])
+all_losses_dev = np.array([run[:min_len] for run in all_losses_dev])
+
+mean_train_loss = all_losses_train.mean(axis=0)
+mean_dev_loss = all_losses_dev.mean(axis=0)
+
+# Plot of the train and valid losses
+plt.figure(num=3, figsize=(8, 5)).patch.set_facecolor('white')
+plt.title('Mean Train and Dev Losses over Runs')
 plt.ylabel('Loss')
 plt.xlabel('Epochs')
-plt.plot(sampled_epochs, losses_train, label='Train loss')
-plt.plot(sampled_epochs, losses_dev, label='Dev loss')
+plt.plot(trimmed_epochs, mean_train_loss, label='Train loss')
+plt.plot(trimmed_epochs, mean_dev_loss, label='Dev loss')
 plt.legend()
+plt.grid(True)
 plt.show()
