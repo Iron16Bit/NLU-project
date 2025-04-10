@@ -1,0 +1,16 @@
+# Model Hyperparameters
+lrs = [0.001, 0.1, 0.3, 0.5, 0.7, 1, 1.5]
+hidden_size = 300
+emb_size = 300
+#dropouts = [0.0001, 0.001, 0.01, 0.1, 0.2, 0.3, 0.5, 0.7, 1, 1.5]
+dropouts = 0.#2
+clip = 0.25
+
+# Training settings
+n_epochs = 100
+patience = 10
+
+GPU = "cuda:0"
+CPU = 'cpu'
+
+DEVICE = GPU
