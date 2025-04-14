@@ -1,5 +1,43 @@
 import torch.nn as nn
 
+# Part 1-B.1
+# Original LSTM
+class LM_LSTM_0(nn.Module):
+    def __init__(self, emb_size, hidden_size, output_size, pad_index=0, n_layers=1):
+        super(LM_LSTM_0, self).__init__()
+        self.embedding = nn.Embedding(output_size, emb_size, padding_idx=pad_index)
+        self.lstm = nn.LSTM(emb_size, hidden_size, n_layers, bidirectional=False, batch_first=True)
+        self.pad_token = pad_index
+        self.output = nn.Linear(hidden_size, output_size)
+
+    def forward(self, input_sequence):
+        emb = self.embedding(input_sequence)
+        lstm_out, _ = self.lstm(emb)
+        output = self.output(lstm_out).permute(0, 2, 1)
+        return output
+    
+# Part 1-B.1
+# LSTM with Weight Tying
+class LM_LSTM_wt(nn.Module):
+    def __init__(self, emb_size, hidden_size, output_size, pad_index=0, n_layers=1):
+        super(LM_LSTM_wt, self).__init__()
+        self.embedding = nn.Embedding(output_size, emb_size, padding_idx=pad_index)
+        self.lstm = nn.LSTM(emb_size, hidden_size, n_layers, bidirectional=False, batch_first=True)
+        self.pad_token = pad_index
+        self.output = nn.Linear(hidden_size, output_size)
+        # Weight Tying - Use the same weights
+        self.output.weight = self.embedding.weight
+
+    def forward(self, input_sequence):
+        emb = self.embedding(input_sequence)
+        lstm_out, _ = self.lstm(emb)
+        output = self.output(lstm_out).permute(0, 2, 1)
+        return output
+
+# ----------------------------------------------------------------------------------------------------------------
+
+# Part 1-B.2
+# Variational Dropout
 def apply_variational_dropout(x, dropout_prob):
     # Ensure the tensor is not in evaluation mode and dropout is needed
     if not x.requires_grad or dropout_prob == 0:

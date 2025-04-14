@@ -88,7 +88,7 @@ class ModelIAS_bi(nn.Module):
     # https://arxiv.org/abs/1409.2329
 class ModelIAS_drop(nn.Module):
 
-    def __init__(self, hid_size, out_slot, out_int, emb_size, vocab_len, n_layer=1, pad_index=0):
+    def __init__(self, hid_size, out_slot, out_int, emb_size, vocab_len, n_layer=1, pad_index=0, dropout=0.1):
         super(ModelIAS_drop, self).__init__()
 
         self.embedding = nn.Embedding(vocab_len, emb_size, padding_idx=pad_index)
@@ -96,7 +96,7 @@ class ModelIAS_drop(nn.Module):
         self.slot_out = nn.Linear(2 * hid_size, out_slot)
         self.intent_out = nn.Linear(2 * hid_size, out_int)
 
-        self.dropout = nn.Dropout(0.1)  # Dropout layer for regularization
+        self.dropout = nn.Dropout(dropout)  # Dropout layer for regularization
 
     def forward(self, utterance, seq_lengths):
         utt_emb = self.dropout(self.embedding(utterance))  # Dropout after embedding

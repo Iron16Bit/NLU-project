@@ -24,5 +24,3 @@ Starting from the LM_RNN in which you replaced the RNN with a LSTM model, apply 
 - Weight Tying
 - Variational Dropout (no DropConnect)
 - Non-monotonically Triggered AvSGD
-
-## Lab 5 Mandatory Exercises

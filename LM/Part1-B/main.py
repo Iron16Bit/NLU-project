@@ -29,6 +29,31 @@ start_averaging = False
 n_avg = 0
 avg_model = None
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Classic training loop with simple SGD
+# for epoch in range(n_epochs):
+	# train_loop(train_loader, optimizer, criterion_train, model, clip)
+	# ppl_dev, _ = eval_loop(dev_loader, criterion_eval, model)
+
+	# print(f"Epoch {epoch+1}: dropout={dropout}, PPL={ppl_dev}")
+
+	# if ppl_dev < best_local_ppl:
+	# 	best_local_ppl = ppl_dev
+	# 	best_local_model = copy.deepcopy(model)
+	# 	local_patience = patience
+	# else:
+	# 	local_patience -= 1
+
+	# if local_patience <= 0:
+	# 	break
+
+	# if best_local_ppl < best_ppl:
+	# 	best_ppl = best_local_ppl
+	# 	best_model = best_local_model
+	# 	best_params = dropout
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Part 1-B.3
 # Non-monotonically Triggered AvSGD instead of SGD -> Average the weights if the PPL doesn't improve for #patience epochs
 for epoch in range(n_epochs):
     train_loop(train_loader, optimizer, criterion_train, model, clip)

@@ -17,7 +17,13 @@ vocab_len = len(lang.word2id)
 model = LM_LSTM(emb_size, hidden_size, vocab_len, pad_index=lang.word2id["<pad>"], emb_dropout=dropout, out_dropout=dropout).to(DEVICE)
 model.load_state_dict(torch.load('bin/dropout_lstm_adam.pt'))
 
-# Training uses AdamW
+# ------------------------------------------------------------------------
+# Training using SGD
+# optimizer = optim.SGD(model.parameters(), lr=lr)
+# ------------------------------------------------------------------------
+
+# Part 1-A.3
+# Training using AdamW
 optimizer = optim.AdamW(model.parameters(), lr=lr)
 criterion_train = nn.CrossEntropyLoss(ignore_index=lang.word2id["<pad>"])
 criterion_eval = nn.CrossEntropyLoss(ignore_index=lang.word2id["<pad>"], reduction='sum')
