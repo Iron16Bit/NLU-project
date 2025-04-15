@@ -27,4 +27,4 @@ The models that you can experiment with are [*BERT-base* or *BERT-large*](https:
 **Intent classification**: accuracy <br>
 **Slot filling**: F1 score with conll
 
-***Dataset to use: ATIS***
+***Dataset to use: ATIS***  
