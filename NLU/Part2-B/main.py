@@ -1,281 +1,133 @@
-import os
-import torch
-import torch.nn as nn
+# This file is used to run your functions and print the results
+# Please write your fuctions or classes in the functions.py
+
+# Import everything from functions.py file
+from functions import *
+from utils import *
+from model import StandardBERT
+
+from tqdm import tqdm
+from transformers import BertTokenizerFast
+import copy
+import math
 import torch.optim as optim
 import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup
-from torch.utils.data import DataLoader
+import torch.nn as nn
+import os
 
-# Import our model and dataset classes
-from model import (
-    BertIntentSlotModel, 
-    JointBertDataset, 
-    collate_fn, 
-    train_loop, 
-    eval_loop
-)
+from config import n_epochs, dropout, lr, PAD_TOKEN, clip
 
-# Import from existing code
-from utils import lang, train_loader, dev_loader, test_loader
-from config import device, clip, lr, n_epochs, runs
+if __name__ == "__main__":
+    patience_fixed = 5
+    current_patience = patience_fixed
 
-# Global variables
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+    losses_train = []
+    losses_val = []
+    sampled_epochs = []
 
-# Set seeds for reproducibility
-seed = 42
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-np.random.seed(seed)
+    best_model = None
+    pbar = tqdm(range(1, n_epochs + 1))
 
-# Model configurations
-bert_model_name = "bert-base-uncased"  # You can change to "bert-large-uncased" if you have enough resources
-num_intents = len(lang.intent2id)
-num_slots = len(lang.slot2id)
-PAD_TOKEN = -100  # Use -100 for CrossEntropyLoss to ignore padding
+    GPU = "cuda:0" if torch.cuda.is_available() else "cpu"
+    CPU = 'cpu'
 
-# Training configurations
-warmup_steps = 0
-weight_decay = 0.01
-dropout_rates = [0.1, 0.2, 0.3]  # Different dropout rates to experiment with
+    # Set a seed for reproducibility of experiments
+    torch.manual_seed(32)
+    exp_name = "standard_bert"
 
-# Initialize tokenizer
-tokenizer = BertTokenizer.from_pretrained(bert_model_name)
+    # Use the local ATIS dataset
+    print("Loading ATIS dataset from local directory...")
+    atis_data = load_from_local_atis()
+    
+    train_raw_data = atis_data['train']
+    test_raw_data = atis_data['test']
+    
+    print('Train samples:', len(train_raw_data))
+    print('Test samples:', len(test_raw_data))
 
-# Function to preprocess the data and create dataset objects
-def preprocess_data(texts, slot_labels, intent_labels, tokenizer, max_length=128):
-    dataset = JointBertDataset(
-        texts=texts,
-        slot_labels=slot_labels,
-        intent_labels=intent_labels,
-        tokenizer=tokenizer,
-        max_length=max_length
+    # Build the validation set
+    train_raw_data, intent_train, val_raw_data, intent_val = generate_validation_set(
+        training_set_raw=train_raw_data, 
+        percentage=0.1
     )
-    return dataset
 
-# Extract raw data from the existing DataLoader objects
-def extract_data_from_loader(loader):
-    texts, slot_labels, intent_labels = [], [], []
+    intent_test, words, corpus, slots, total_intents = get_dataset_informations(
+        train_raw_data=train_raw_data, 
+        val_raw_data=val_raw_data, 
+        test_raw_data=test_raw_data
+    )
+
+    lang = Lang(words, total_intents, slots, cutoff=0)
+    slots.add('pad')
+
+    criterion_slots = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
+    criterion_intents = nn.CrossEntropyLoss()  # Because we do not have the pad token
+
+    model_name = 'bert-base-uncased'
+    max_token_len = 50
+
+    # Use the standard BERT model instead of the modified one
+    print(f"Creating standard BERT model with {len(total_intents)} intents and {len(slots)} slots")
+    model = StandardBERT(num_intents=len(total_intents), num_slots=len(slots)).to(GPU)
+    tokenizer = BertTokenizerFast.from_pretrained(model_name)
+
+    train_loader, val_loader, test_loader = build_dataloaders(
+        train_raw=train_raw_data, 
+        val_raw=val_raw_data, 
+        test_raw=test_raw_data, 
+        lang=lang,
+        tokenizer=tokenizer
+    )
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+
+    losses_train = []
+    losses_val = []
+    sampled_epochs = []
+    best_f1 = 0
+    best_model = model
+
+    print("Starting training...")
+    for epoch in pbar:
+        loss = train(model=model, data=train_loader, optimizer=optimizer, clip=clip, 
+                     criterion_slots=criterion_slots, criterion_intents=criterion_intents, device=GPU)
+        
+        if epoch % 1 == 0:
+            sampled_epochs.append(epoch)
+            losses_train.append(np.asarray(loss).mean())
+
+            results_val, intent_res, loss_val = validation(model=model, data=val_loader, lang=lang, 
+                                                       criterion_slots=criterion_slots, criterion_intents=criterion_intents, 
+                                                       tokenizer=tokenizer, device=GPU)
+            losses_val.append(np.asarray(loss_val).mean())
+        
+            f1 = results_val['total']['f']
+
+            pbar.set_description(f"f1: {f1:.4f}")
+
+            if f1 > best_f1:
+                best_f1 = f1
+                current_patience = patience_fixed
+                best_model = copy.deepcopy(model).to(CPU)
+            else:
+                current_patience -= 1
+
+            if current_patience <= 0:
+                print(f"Early stopping at epoch {epoch}")
+                break
     
-    for batch in loader.dataset:
-        # Assuming each batch has a text, intent_label, and slot_labels
-        texts.append(batch[0])  # Assuming text is the first item
-        intent_labels.append(batch[1])  # Assuming intent label is the second item
-        slot_labels.append(batch[2])  # Assuming slot labels are the third item
+    print("\nEvaluating on test set...")
+    best_model = best_model.to(GPU)
+    results_test, intent_test, _ = validation(model=best_model, data=test_loader, lang=lang, 
+                                           criterion_slots=criterion_slots, criterion_intents=criterion_intents, 
+                                           tokenizer=tokenizer, device=GPU)
     
-    return texts, slot_labels, intent_labels
+    print('Slot F1: ', results_test['total']['f'])
+    print('Intent Accuracy:', intent_test['accuracy'])
 
-# Extract data for creating our BERT datasets
-train_texts, train_slot_labels, train_intent_labels = extract_data_from_loader(train_loader)
-dev_texts, dev_slot_labels, dev_intent_labels = extract_data_from_loader(dev_loader)
-test_texts, test_slot_labels, test_intent_labels = extract_data_from_loader(test_loader)
-
-# Create datasets
-train_dataset = preprocess_data(train_texts, train_slot_labels, train_intent_labels, tokenizer)
-dev_dataset = preprocess_data(dev_texts, dev_slot_labels, dev_intent_labels, tokenizer)
-test_dataset = preprocess_data(test_texts, test_slot_labels, test_intent_labels, tokenizer)
-
-# Create DataLoaders
-bert_train_loader = DataLoader(
-    train_dataset, 
-    batch_size=16, 
-    shuffle=True, 
-    collate_fn=collate_fn
-)
-
-bert_dev_loader = DataLoader(
-    dev_dataset, 
-    batch_size=16, 
-    shuffle=False, 
-    collate_fn=collate_fn
-)
-
-bert_test_loader = DataLoader(
-    test_dataset, 
-    batch_size=16, 
-    shuffle=False, 
-    collate_fn=collate_fn
-)
-
-# Loss functions
-intent_criterion = nn.CrossEntropyLoss()
-slot_criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
-
-# Function to initialize weights
-def init_bert_weights(model):
-    """Initialize weights for non-BERT layers"""
-    for name, param in model.named_parameters():
-        if "bert" not in name:  # Only initialize non-BERT weights
-            if "bias" in name:
-                nn.init.zeros_(param)
-            elif "weight" in name:
-                nn.init.xavier_normal_(param)
-    return model
-
-# Experiment with different dropout rates
-slot_f1s_all = []
-intent_acc_all = []
-
-for dropout_rate in dropout_rates:
-    print(f"\n=== Training with Dropout: {dropout_rate} ===")
+    # Create models directory if it doesn't exist
+    os.makedirs("./models", exist_ok=True)
     
-    slot_f1s = []
-    intent_acc = []
-    
-    for run in tqdm(range(0, runs)):
-        # Initialize model
-        model = BertIntentSlotModel(
-            bert_model_name=bert_model_name,
-            num_intents=num_intents,
-            num_slots=num_slots,
-            dropout_rate=dropout_rate
-        ).to(device)
-        
-        # Apply weight initialization for non-BERT layers
-        model = init_bert_weights(model)
-        
-        # Group parameters for different learning rates
-        # BERT layers usually need a smaller learning rate than the task-specific layers
-        no_decay = ['bias', 'LayerNorm.weight']
-        bert_param_optimizer = list(model.bert.named_parameters())
-        classifier_param_optimizer = list(model.intent_classifier.named_parameters()) + \
-                                     list(model.slot_classifier.named_parameters())
-        
-        optimizer_grouped_parameters = [
-            # BERT parameters with weight decay
-            {
-                'params': [p for n, p in bert_param_optimizer if not any(nd in n for nd in no_decay)],
-                'weight_decay': weight_decay,
-                'lr': lr / 10  # Lower learning rate for BERT
-            },
-            # BERT parameters without weight decay
-            {
-                'params': [p for n, p in bert_param_optimizer if any(nd in n for nd in no_decay)],
-                'weight_decay': 0.0,
-                'lr': lr / 10
-            },
-            # Task-specific parameters with weight decay
-            {
-                'params': [p for n, p in classifier_param_optimizer if not any(nd in n for nd in no_decay)],
-                'weight_decay': weight_decay,
-                'lr': lr
-            },
-            # Task-specific parameters without weight decay
-            {
-                'params': [p for n, p in classifier_param_optimizer if any(nd in n for nd in no_decay)],
-                'weight_decay': 0.0,
-                'lr': lr
-            }
-        ]
-        
-        # Initialize optimizer
-        optimizer = AdamW(optimizer_grouped_parameters, lr=lr)
-        
-        # Calculate total steps for learning rate scheduler
-        total_steps = len(bert_train_loader) * n_epochs
-        
-        # Create scheduler with linear warmup
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps
-        )
-        
-        # Training loop
-        patience = 3
-        best_f1 = 0
-        losses_train = []
-        losses_dev = []
-        sampled_epochs = []
-        
-        for epoch in range(1, n_epochs):
-            # Train
-            loss = train_loop(
-                dataloader=bert_train_loader,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                intent_criterion=intent_criterion,
-                slot_criterion=slot_criterion,
-                device=device
-            )
-            
-            if epoch % 5 == 0:
-                sampled_epochs.append(epoch)
-                losses_train.append(loss)
-                
-                # Evaluate on dev set
-                results_dev, intent_res, loss_dev = eval_loop(
-                    dataloader=bert_dev_loader,
-                    model=model,
-                    intent_criterion=intent_criterion,
-                    slot_criterion=slot_criterion,
-                    device=device,
-                    lang=lang
-                )
-                
-                losses_dev.append(loss_dev)
-                
-                # Check if we should stop early
-                f1 = results_dev['total']['f']
-                if f1 > best_f1:
-                    best_f1 = f1
-                else:
-                    patience -= 1
-                
-                if patience <= 0:
-                    print(f"Early stopping at epoch {epoch}")
-                    break
-        
-        # Evaluate on test set
-        results_test, intent_test, _ = eval_loop(
-            dataloader=bert_test_loader,
-            model=model,
-            intent_criterion=intent_criterion,
-            slot_criterion=slot_criterion,
-            device=device,
-            lang=lang
-        )
-        
-        intent_acc.append(intent_test['accuracy'])
-        slot_f1s.append(results_test['total']['f'])
-    
-    # After all runs for this dropout value
-    slot_f1s = np.asarray(slot_f1s)
-    intent_acc = np.asarray(intent_acc)
-    slot_f1s_all.append(slot_f1s)
-    intent_acc_all.append(intent_acc)
-    
-    print(f'Dropout {dropout_rate} -> Slot F1: {round(slot_f1s.mean(), 3)} ± {round(slot_f1s.std(), 3)}')
-    print(f'Dropout {dropout_rate} -> Intent Acc: {round(intent_acc.mean(), 3)} ± {round(intent_acc.std(), 3)}')
-
-print("\n=== Summary of All Dropout Settings ===")
-for i, dropout_rate in enumerate(dropout_rates):
-    print(f'Dropout {dropout_rate} -> Slot F1: {round(slot_f1s_all[i].mean(), 3)} ± {round(slot_f1s_all[i].std(), 3)}, '
-          f'Intent Acc: {round(intent_acc_all[i].mean(), 3)} ± {round(intent_acc_all[i].std(), 3)}')
-
-# Find best dropout rate based on F1 score
-best_dropout_idx = np.argmax([s.mean() for s in slot_f1s_all])
-best_dropout = dropout_rates[best_dropout_idx]
-print(f"\nBest dropout rate: {best_dropout}")
-
-# Plot results for the best dropout rate
-plt.figure(figsize=(12, 5))
-plt.subplot(1, 2, 1)
-plt.boxplot(slot_f1s_all)
-plt.xticks(range(1, len(dropout_rates) + 1), dropout_rates)
-plt.title('Slot F1 Scores by Dropout Rate')
-plt.xlabel('Dropout Rate')
-plt.ylabel('F1 Score')
-
-plt.subplot(1, 2, 2)
-plt.boxplot(intent_acc_all)
-plt.xticks(range(1, len(dropout_rates) + 1), dropout_rates)
-plt.title('Intent Accuracy by Dropout Rate')
-plt.xlabel('Dropout Rate')
-plt.ylabel('Accuracy')
-
-plt.tight_layout()
-plt.show()
+    # Save the best model
+    torch.save(best_model.state_dict(), f"./models/{exp_name}.pth")
+    print(f"Best model saved to ./models/{exp_name}.pth")

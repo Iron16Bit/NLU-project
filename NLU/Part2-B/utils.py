@@ -1,340 +1,211 @@
-import os
-import json
 import torch
-from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizer
-from sklearn.model_selection import train_test_split
-from collections import Counter
+from torch.utils.data import Dataset
+from subprocess import run
 
-# Constants
-PAD_TOKEN = 0
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load the dataset
+class IntentsAndSlots(Dataset):
+    # Mandatory methods are __init__, __len__ and __getitem__
+    def __init__(self, dataset, lang, unk='unk', tokenizer=None, max_len=50, myType=None):
+        self.utterances = []
+        self.intents = []
+        self.slots = []
+        self.unk = unk
+        self.lang = lang
+
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        
+        for x in dataset:
+            self.utterances.append(x['utterance'])
+            self.slots.append(x['slots'])
+            self.intents.append(x['intent'])
+
+        self.utt_ids = self.mapping_seq(self.utterances, lang.word2id)
+        self.slot_ids = self.mapping_seq(self.slots, lang.slot2id)
+        self.intent_ids = self.mapping_labels(self.intents, lang.intent2id)
+
+
+    def __len__(self):
+        return len(self.utterances)
+
+    def __getitem__(self, idx):
+        #utt = torch.Tensor(self.utt_ids[idx])
+        utt = self.utterances[idx]
+        #utt_ids = self.utt_ids[idx]
+        slots_ids = self.slot_ids[idx]
+        intent = self.intent_ids[idx]
+        #slots_labels = self.slots[idx]
+
+
+        # Tokenize the utterance into words
+        words = utt.split()
+        word_slots = []
+        for word, slot in zip(words, slots_ids):
+            subwords = self.tokenizer.tokenize(word)
+            word_slots.extend([slot] * len(subwords))
+
+        '''text_encoding = self.tokenizer.encode_plus(utt,
+                                                   max_length=self.max_len,
+                                                   add_special_tokens=True,
+                                                   padding='max_length',
+                                                   truncation=True,
+                                                   return_attention_mask=True,
+                                                   return_tensors='pt')
+        
+
+        token = self.tokenizer.tokenize(utt)
+        token_ids = text_encoding['input_ids'].flatten()
+        attention_mask = text_encoding['attention_mask'].flatten()'''
+
+        inputs = self.tokenizer(utt,
+                                padding='max_length',
+                                truncation=True,
+                                max_length=self.max_len,
+                                return_tensors='pt')
+        
+
+        inputs_ids = inputs['input_ids'].squeeze()
+        attention_mask = inputs['attention_mask'].squeeze()
+        #tokens = self.tokenizer.tokenize(utt)
+
+        aligned_labels = [self.lang.slot2id['O']] + word_slots + [self.lang.slot2id['O']]
+
+        while len(aligned_labels) < len(inputs_ids):
+            aligned_labels.append(self.lang.slot2id['pad'])
+
+        aligned_labels = aligned_labels[:len(inputs_ids)]  # Ensure alignment
+
+        
+        sample = {'utterance': inputs_ids,
+                  'attention_mask': attention_mask,
+                  'slots': torch.tensor(aligned_labels),
+                  'intent': intent
+                  }
+
+        
+        '''sample = {'utterance': token_ids,
+                  'attention_mask': torch.Tensor(attention_mask),
+                  #'tokenizer': self.tokenizer,
+                  'original_utterance': utt,
+                  #'intent': torch.tensor(intent),
+                  #'slots': torch.tensor(slots)
+                  'intent': intent,
+                  'slots': torch.Tensor(encoded)
+                 }'''
+        return sample
+    
+    # Auxiliary methods
+    
+    def mapping_labels(self, data, mapper):
+        return [mapper[x] if x in mapper else mapper[self.unk] for x in data]
+    
+    def mapping_seq(self, data, mapper): # Map sequences to number
+        res = []
+        for seq in data:
+            tmp_seq = []
+            for x in seq.split():
+                if x in mapper:
+                    tmp_seq.append(mapper[x])
+                else:
+                    tmp_seq.append(mapper[self.unk])
+            res.append(tmp_seq)
+        return res
+    
+
+# Loading the corpus
 def load_data(path):
-    '''
-        input: path/to/data
-        output: json 
-    '''
+    from json import loads
     dataset = []
     with open(path) as f:
-        dataset = json.loads(f.read())
+        dataset = loads(f.read())
     return dataset
 
-class InputExample:
-    """A single training/test example for token classification."""
-    def __init__(self, guid, words, intent_label, slot_labels):
-        """
-        Args:
-            guid: Unique id for the example
-            words: List of words/tokens in the sentence
-            intent_label: The intent label of the sentence
-            slot_labels: Slot labels for each word/token
-        """
-        self.guid = guid
-        self.words = words
-        self.intent_label = intent_label
-        self.slot_labels = slot_labels
 
-
-class InputFeatures:
-    """Features created from a single sentence for the BERT joint model."""
-    def __init__(self, input_ids, attention_mask, token_type_ids, 
-                 intent_label, slot_labels, subword_indices):
-        self.input_ids = input_ids
-        self.attention_mask = attention_mask
-        self.token_type_ids = token_type_ids
-        self.intent_label = intent_label
-        self.slot_labels = slot_labels
-        self.subword_indices = subword_indices
-
-
-def convert_examples_to_features(examples, tokenizer, max_seq_length, 
-                                 slot_label_map, intent_label_map, pad_token_label_id=-100):
+def load_from_local_atis(data_dir='dataset/ATIS'):
     """
-    Convert examples to features that can be fed to the BERT model
-    
+    Load data from the local ATIS dataset directory
     Args:
-        examples: InputExample objects
-        tokenizer: BERT tokenizer
-        max_seq_length: Maximum sequence length
-        slot_label_map: Dictionary mapping slot labels to ids
-        intent_label_map: Dictionary mapping intent labels to ids
-        pad_token_label_id: Label id for padding tokens
-        
+        data_dir: Path to the ATIS dataset directory
     Returns:
-        List of InputFeatures
+        Dictionary containing training, validation and test datasets
     """
-    features = []
+    import os
+    from json import loads
     
-    for (ex_index, example) in enumerate(examples):
-        # Convert words to BERT wordpieces
-        tokens = []
-        slot_label_ids = []
-        subword_indices = []  # To keep track of the first subword of each token
-        
-        word_tokens = [tokenizer.tokenize(word) for word in example.words]
-        
-        # Flatten and track which indices to use for the original tokens
-        curr_token_index = 1  # Start at 1 to account for [CLS]
-        for i, word_token_list in enumerate(word_tokens):
-            # Record the index of the first subword for each original token
-            subword_indices.append(curr_token_index)
-            
-            # Add all subwords and their labels
-            for j, subword in enumerate(word_token_list):
-                tokens.append(subword)
-                # Only the first subword of a token gets the label
-                if j == 0:
-                    slot_label_ids.append(slot_label_map[example.slot_labels[i]])
-                else:
-                    # Use special token for remaining subwords
-                    slot_label_ids.append(pad_token_label_id)
-                
-            curr_token_index += len(word_token_list)
-        
-        # Add special tokens
-        tokens = [tokenizer.cls_token] + tokens + [tokenizer.sep_token]
-        
-        input_ids = tokenizer.convert_tokens_to_ids(tokens)
-        attention_mask = [1] * len(input_ids)
-        token_type_ids = [0] * len(input_ids)  # Single sequence, so all 0s
-        
-        # Pad sequences to max_seq_length
-        padding_length = max_seq_length - len(input_ids)
-        if padding_length > 0:
-            input_ids = input_ids + ([tokenizer.pad_token_id] * padding_length)
-            attention_mask = attention_mask + ([0] * padding_length)
-            token_type_ids = token_type_ids + ([0] * padding_length)
-        else:
-            # Truncate if too long
-            input_ids = input_ids[:max_seq_length]
-            attention_mask = attention_mask[:max_seq_length]
-            token_type_ids = token_type_ids[:max_seq_length]
-            # Adjust subword_indices if we truncated
-            subword_indices = [idx for idx in subword_indices if idx < max_seq_length - 1]
-        
-        # Convert intent label to id
-        intent_label_id = intent_label_map[example.intent_label]
-        
-        assert len(input_ids) == max_seq_length
-        assert len(attention_mask) == max_seq_length
-        assert len(token_type_ids) == max_seq_length
-        
-        # Create feature object
-        feature = InputFeatures(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            intent_label=intent_label_id,
-            slot_labels=slot_label_ids,
-            subword_indices=subword_indices
-        )
-        
-        features.append(feature)
+    data = {}
     
-    return features
-
-
-class BertJointDataset(Dataset):
-    """Dataset for BERT joint intent classification and slot filling"""
-    def __init__(self, features):
-        self.features = features
-        
-    def __len__(self):
-        return len(self.features)
-    
-    def __getitem__(self, idx):
-        feature = self.features[idx]
-        return {
-            "input_ids": torch.tensor(feature.input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(feature.attention_mask, dtype=torch.long),
-            "token_type_ids": torch.tensor(feature.token_type_ids, dtype=torch.long),
-            "intent_label": torch.tensor(feature.intent_label, dtype=torch.long),
-            "slot_labels": torch.tensor(feature.slot_labels, dtype=torch.long),
-            "subword_indices": feature.subword_indices
-        }
-
-
-def prepare_dataset_from_raw(data_raw, tokenizer, intent_label_map, slot_label_map, max_seq_length=128):
-    """
-    Prepare dataset for BERT model from raw ATIS data
-    
-    Args:
-        data_raw: Raw ATIS data (list of dictionaries)
-        tokenizer: BERT tokenizer
-        intent_label_map: Dictionary mapping intent labels to ids
-        slot_label_map: Dictionary mapping slot labels to ids
-        max_seq_length: Maximum sequence length
-        
-    Returns:
-        BertJointDataset
-    """
-    examples = []
-    for i, item in enumerate(data_raw):
-        words = item['utterance'].split()
-        intent_label = item['intent']
-        slot_labels = item['slots'].split()
-        
-        # Make sure the number of words matches the number of slot labels
-        assert len(words) == len(slot_labels), f"Words and slots length mismatch for example {i}"
-        
-        example = InputExample(
-            guid=f"example-{i}",
-            words=words,
-            intent_label=intent_label,
-            slot_labels=slot_labels
-        )
-        examples.append(example)
-    
-    features = convert_examples_to_features(
-        examples=examples,
-        tokenizer=tokenizer,
-        max_seq_length=max_seq_length,
-        slot_label_map=slot_label_map,
-        intent_label_map=intent_label_map
-    )
-    
-    return BertJointDataset(features)
-
-
-def bert_collate_fn(batch):
-    """
-    Collate function for BERT model
-    
-    Args:
-        batch: List of samples from BertJointDataset
-        
-    Returns:
-        Dictionary with batched tensors
-    """
-    input_ids = torch.stack([item["input_ids"] for item in batch]).to(device)
-    attention_mask = torch.stack([item["attention_mask"] for item in batch]).to(device)
-    token_type_ids = torch.stack([item["token_type_ids"] for item in batch]).to(device)
-    intent_label = torch.stack([item["intent_label"] for item in batch]).to(device)
-    
-    # For slot labels, we need to handle variable lengths
-    max_len = max([len(item["subword_indices"]) for item in batch])
-    batch_size = len(batch)
-    
-    # Create padded tensor for slot labels
-    slot_labels_padded = torch.ones(batch_size, max_len, dtype=torch.long) * PAD_TOKEN
-    for i, item in enumerate(batch):
-        subword_indices = item["subword_indices"]
-        slot_labels = item["slot_labels"]
-        
-        # Extract the slot labels for the first subword of each token
-        for j, idx in enumerate(subword_indices):
-            if j < max_len:
-                if idx < len(slot_labels):
-                    slot_labels_padded[i, j] = slot_labels[idx]
-    
-    slot_labels_padded = slot_labels_padded.to(device)
-    
-    # Create a list of subword indices for each item in the batch
-    subword_indices = [item["subword_indices"] for item in batch]
-    
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "token_type_ids": token_type_ids,
-        "intent_label": intent_label,
-        "slot_labels": slot_labels_padded,
-        "subword_indices": subword_indices
+    # Map of expected files in the ATIS directory
+    file_mapping = {
+        'train': 'atis.train.json',
+        'valid': 'atis.dev.json',
+        'test': 'atis.test.json'
     }
+    
+    # Load each dataset file
+    for split, filename in file_mapping.items():
+        filepath = os.path.join(data_dir, filename)
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                data[split] = loads(f.read())
+            print(f"Loaded {split} set with {len(data[split])} examples")
+        else:
+            print(f"Warning: {filepath} not found")
+    
+    return data
 
 
-def main():
-    # Load ATIS dataset
-    train_raw = load_data(os.path.join('dataset', 'ATIS', 'train.json'))
-    test_raw = load_data(os.path.join('dataset', 'ATIS', 'test.json'))
-    
-    # Create a dev set
-    portion = 0.10
-    intents = [x['intent'] for x in train_raw]
-    count_y = Counter(intents)
-    
+def generate_validation_set(training_set_raw, percentage=0.1):
+    from collections import Counter
+    from sklearn.model_selection import train_test_split
+
+    intents = [x['intent'] for x in training_set_raw]
+    count_intents = Counter(intents)
+
     labels = []
     inputs = []
     mini_train = []
-    
-    for id_y, y in enumerate(intents):
-        if count_y[y] > 1:  # If some intents occur only once, we put them in training
-            inputs.append(train_raw[id_y])
-            labels.append(y)
-        else:
-            mini_train.append(train_raw[id_y])
-    
-    # Random Stratify
-    X_train, X_dev, y_train, y_dev = train_test_split(
-        inputs, labels, test_size=portion, 
-        random_state=42, 
-        shuffle=True,
-        stratify=labels
-    )
-    X_train.extend(mini_train)
-    train_raw = X_train
-    dev_raw = X_dev
-    
-    # Get all slot and intent labels
-    corpus = train_raw + dev_raw + test_raw
-    slots = set(sum([line['slots'].split() for line in corpus], []))
-    intents = set([line['intent'] for line in corpus])
-    
-    # Create label maps
-    slot_label_map = {label: i for i, label in enumerate(slots)}
-    slot_label_map['pad'] = PAD_TOKEN  # Add padding token
-    
-    intent_label_map = {label: i for i, label in enumerate(intents)}
-    
-    # Initialize BERT tokenizer
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    
-    # Create datasets
-    train_dataset = prepare_dataset_from_raw(
-        train_raw, tokenizer, intent_label_map, slot_label_map
-    )
-    dev_dataset = prepare_dataset_from_raw(
-        dev_raw, tokenizer, intent_label_map, slot_label_map
-    )
-    test_dataset = prepare_dataset_from_raw(
-        test_raw, tokenizer, intent_label_map, slot_label_map
-    )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=32,
-        shuffle=True,
-        collate_fn=bert_collate_fn
-    )
-    dev_loader = DataLoader(
-        dev_dataset,
-        batch_size=64,
-        shuffle=False,
-        collate_fn=bert_collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=64,
-        shuffle=False,
-        collate_fn=bert_collate_fn
-    )
-    
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Dev dataset size: {len(dev_dataset)}")
-    print(f"Test dataset size: {len(test_dataset)}")
-    
-    # Example usage of a batch
-    for batch in train_loader:
-        print("Batch shape:")
-        print(f"Input IDs: {batch['input_ids'].shape}")
-        print(f"Attention Mask: {batch['attention_mask'].shape}")
-        print(f"Token Type IDs: {batch['token_type_ids'].shape}")
-        print(f"Intent Label: {batch['intent_label'].shape}")
-        print(f"Slot Labels: {batch['slot_labels'].shape}")
-        break
+
+    for idx, intent in enumerate(intents):
+        # if intent occurs only once, put it in train
+        if(count_intents[intent] > 1):
+            inputs.append(training_set_raw[idx])
+            labels.append(intent)
+        else: #else put it in val
+            mini_train.append(training_set_raw[idx])
+
+    x_train, x_val, intent_train, intent_val = train_test_split(inputs, labels, test_size=percentage, random_state=42, shuffle=True, stratify=labels)
+
+    x_train.extend(mini_train)
+    train_raw = x_train
+    val_raw = x_val
 
 
-if __name__ == "__main__":
-    main()
+    ''' train_raw[0]= {'intent': 'airfare',
+                        'slots': 'O O O O O O O O B-fromloc.city_name O B-toloc.city_name',
+                        'utterance': 'what is the cost for these flights from baltimore to '
+                                     'philadelphia'
+                       }
+        y_train[0] = intent of train_raw[0]
+            
+        val_raw[0] is same as train but for the validation set (generated one)
+        y_val[0] = intent of val_raw[0]
+
+        test_raw[0] same as the other two but for test set
+        y_test[0] = intent of test_raw[0]
+    
+    '''
+
+    # Intent distributions
+    # print('Train:')
+    # pprint({k:round(v/len(y_train),3)*100 for k, v in sorted(Counter(y_train).items())})
+    # print('Dev:'), 
+    # pprint({k:round(v/len(y_dev),3)*100 for k, v in sorted(Counter(y_dev).items())})
+    # print('Test:') 
+    # pprint({k:round(v/len(y_test),3)*100 for k, v in sorted(Counter(y_test).items())})
+    # print('='*89)
+    # # Dataset size
+    # print('TRAIN size:', len(train_raw))
+    # print('DEV size:', len(dev_raw))
+    # print('TEST size:', len(test_raw))
+
+    return train_raw, intent_train, val_raw, intent_val
