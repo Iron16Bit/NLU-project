@@ -1,6 +1,9 @@
+import json
+from typing import Counter
 import torch
 from torch.utils.data import Dataset
-from subprocess import run
+from sklearn.model_selection import train_test_split
+import os
 
 
 class IntentsAndSlots(Dataset):
@@ -123,40 +126,73 @@ def load_data(path):
 
 def load_from_local_atis(data_dir='dataset/ATIS'):
     """
-    Load data from the local ATIS dataset directory
-    Args:
-        data_dir: Path to the ATIS dataset directory
-    Returns:
-        Dictionary containing training, validation and test datasets
+    Load ATIS dataset from local directory, creating dev set from train set.
+    Returns a dictionary with 'train', 'test', and 'dev' splits.
     """
-    import os
-    from json import loads
-    
-    data = {}
-    
-    # Map of expected files in the ATIS directory
-    file_mapping = {
-        'train': 'atis.train.json',
-        'valid': 'atis.dev.json',
-        'test': 'atis.test.json'
-    }
-    
-    # Load each dataset file
-    for split, filename in file_mapping.items():
-        filepath = os.path.join(data_dir, filename)
-        if os.path.exists(filepath):
-            with open(filepath, 'r') as f:
-                data[split] = loads(f.read())
-            print(f"Loaded {split} set with {len(data[split])} examples")
-        else:
-            print(f"Warning: {filepath} not found")
-    
-    return data
+    try:
+        # Try to load train and test data
+        train_path = os.path.join(data_dir, 'train.json')
+        test_path = os.path.join(data_dir, 'test.json')
+        
+        train_raw = []
+        test_raw = []
+        
+        with open(train_path) as f:
+            train_raw = json.loads(f.read())
+        
+        with open(test_path) as f:
+            test_raw = json.loads(f.read())
+        
+        # Create dev set from train set following Part2-A approach
+        portion = 0.10
+        
+        intents = [x['intent'] for x in train_raw]  # We stratify on intents
+        count_y = Counter(intents)
+        
+        labels = []
+        inputs = []
+        mini_train = []
+        
+        for id_y, y in enumerate(intents):
+            if count_y[y] > 1:  # If some intents occur only once, we put them in training
+                inputs.append(train_raw[id_y])
+                labels.append(y)
+            else:
+                mini_train.append(train_raw[id_y])
+        
+        # Random Stratify
+        X_train, X_dev, y_train, y_dev = train_test_split(
+            inputs, labels, test_size=portion, 
+            random_state=42, 
+            shuffle=True,
+            stratify=labels
+        )
+        
+        X_train.extend(mini_train)
+        train_raw = X_train
+        dev_raw = X_dev
+        
+        atis_data = {
+            'train': train_raw,
+            'test': test_raw,
+            'dev': dev_raw
+        }
+        
+        # Add this immediately after loading the dataset
+        print("Dataset loaded:", bool(atis_data))
+        if 'train' in atis_data:
+            print("Sample utterance:", atis_data['train'][0]['utterance'] if len(atis_data['train']) > 0 else "No samples")
+        
+        return atis_data
+        
+    except FileNotFoundError as e:
+        print(f"Warning: {e}")
+        print("Make sure the ATIS dataset files are in the correct location.")
+        return {}
 
 
 def generate_validation_set(training_set_raw, percentage=0.1):
     from collections import Counter
-    from sklearn.model_selection import train_test_split
 
     intents = [x['intent'] for x in training_set_raw]
     count_intents = Counter(intents)

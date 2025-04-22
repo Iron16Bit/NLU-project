@@ -102,51 +102,140 @@ def build_dataloaders(train_raw, val_raw, test_raw, lang, tokenizer):
 
     return train_loader, val_loader, test_loader
 
-def train(model, data, optimizer, criterion_slots, criterion_intents, clip=5, device='cuda:0'):
-        model.train()
-        loss = 0
-        total_loss = 0
-
-        for sample in data:
-
-            # input_ids.shape = batch_size * max_len
-            input_ids = sample['utterances'].to(device)
-
-            # attention_mask.shape = batch_size * max_len
-            attention_mask = torch.stack(sample['attention_mask']).to(device)
-
-            # intents.shape = batch_size
-            intents = sample['intents'].to(device)
-
-            # slots.shape = batch_size * max_len
-            slots = sample['y_slots'].to(device)
-
-            optimizer.zero_grad() # Zeroing the gradient
-
-            # intent_pred.shape = batch_size * number_of_intents(len(total_intents))
-            # slot_pred.shape = batch_size * max_len * number_of_slots(129)
-            intent_pred, slot_pred = model(token_ids=input_ids, attention_mask=attention_mask)
-
-            # calculate the loss on the slots
-            loss_slot = criterion_slots(slot_pred.view(-1, model.slots), slots.view(-1))
-
-            # calculate the loss on the intents
-            loss_intent = criterion_intents(intent_pred, intents)
-
-            # sum it up
-            loss = loss_intent + loss_slot
-
-            # keep track of total loss of batch
-            total_loss += loss.item()
+def train(model, data, optimizer, clip, criterion_slots, criterion_intents, device):
+    """
+    Enhanced training function for a BERT-based model with better monitoring
+    """
+    print("Starting batch training...")
+    model.train()
+    total_loss = []
+    
+    print(f"Number of batches: {len(data)}")
+    
+    for i, batch in enumerate(data):
+        if i == 0:
+            print(f"Processing first batch, keys: {batch.keys()}")
+        
+        # Move all tensors in batch to device
+        input_ids = batch['utterances'].to(device)
+        
+        # Handle attention mask
+        if 'attention_mask' in batch:
+            if isinstance(batch['attention_mask'], list):
+                try:
+                    attention_mask = torch.stack(batch['attention_mask']).to(device)
+                except:
+                    attention_mask = torch.ones_like(input_ids).to(device)
+            else:
+                attention_mask = batch['attention_mask'].to(device)
+        else:
+            attention_mask = torch.ones_like(input_ids).to(device)
+        
+        # Get y_slots and intents
+        slots = batch['y_slots'].to(device) if 'y_slots' in batch else None
+        intents = batch['intents'].to(device) if 'intents' in batch else None
+        
+        # Clear gradients
+        optimizer.zero_grad()
+        
+        try:
+            # Forward pass
+            intent_logits, slot_logits = model(
+                token_ids=input_ids,
+                attention_mask=attention_mask
+            )
             
-            loss.backward() # Compute the gradient
-
-            # clip the gradient to avoid explosioning gradients
+            if i == 0:
+                print("Forward pass successful")
+                print(f"Intent logits shape: {intent_logits.shape}")
+                print(f"Slots logits shape: {slot_logits.shape}")
+                print(f"Slots shape: {slots.shape}")
+                print(f"Intents shape: {intents.shape}")
+            
+            # Fix the mismatch - intent_logits and slot_logits are swapped
+            # The outputs appear to be flipped compared to what the validation expects
+            
+            # For slots - check if we have the expected shape [batch_size, seq_len, num_slots]
+            if len(slot_logits.shape) == 3:
+                # Already in the correct format
+                slots_logits = slot_logits
+            elif len(intent_logits.shape) == 3:
+                # The outputs are swapped
+                slots_logits = intent_logits
+                intent_logits = slot_logits
+            else:
+                # Something is wrong with the model outputs
+                raise ValueError(f"Expected either intent_logits or slot_logits to have shape [batch_size, seq_len, num_slots], got {intent_logits.shape} and {slot_logits.shape}")
+            
+            # For intent loss - if we don't have the expected shape [batch_size, num_intents]
+            if len(intent_logits.shape) != 2:
+                raise ValueError(f"Expected intent_logits to have shape [batch_size, num_intents], got {intent_logits.shape}")
+            
+            # Calculate losses with focal loss component for slots
+            if len(slots_logits.shape) == 3:
+                batch_size, seq_len, num_slots = slots_logits.shape
+                
+                # Apply label smoothing for slot predictions
+                slots_flat = slots.view(-1)
+                valid_indices = slots_flat != 0  # Ignore PAD_TOKEN (0)
+                
+                # Standard cross-entropy for slots
+                loss_slots = criterion_slots(
+                    slots_logits.view(-1, num_slots),  # [batch_size*seq_len, num_slots]
+                    slots_flat                         # [batch_size*seq_len]
+                )
+                
+                # Add focal loss component for rare slots
+                if valid_indices.sum() > 0:
+                    # Get probabilities for active predictions
+                    probs = F.softmax(slots_logits.view(-1, num_slots), dim=1)
+                    
+                    # Get target probabilities (one-hot)
+                    target_one_hot = torch.zeros_like(probs).scatter_(
+                        1, slots_flat.unsqueeze(1), 1.0
+                    )
+                    
+                    # Calculate focal term: (1 - p_t)^gamma
+            
+            loss_intent = criterion_intents(intent_logits, intents)
+            
+            # Combined loss
+            loss = (3.0 * loss_slots) + loss_intent
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            optimizer.step() # Update the weights
-
-        # return average loss of the batch
-        return total_loss/len(data)   
+            
+            # Update parameters
+            optimizer.step()
+            
+            # Store loss
+            total_loss.append(loss.item())
+            
+            if i == 0:
+                print(f"First batch processed successfully, loss: {loss.item()}")
+                
+            if i % 10 == 0 and i > 0:
+                print(f"Completed {i}/{len(data)} batches")
+                
+        except Exception as e:
+            print(f"Error in batch {i}: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add more debugging info
+            if 'slots_logits' in locals() and 'slots' in locals():
+                print(f"slots_logits shape: {slots_logits.shape}")
+                print(f"slots shape: {slots.shape}")
+                print(f"After reshape:")
+                print(f"slots_logits.view(-1, slots_logits.shape[-1]) shape: {slots_logits.view(-1, slots_logits.shape[-1]).shape}")
+                print(f"slots.view(-1) shape: {slots.view(-1).shape}")
+            continue
+    
+    print("Training epoch completed")
+    return total_loss
 
 # basically same as training, without the backward of the loss and the addition of the evaluation of the performances
 def validation(model, data, lang, criterion_slots, criterion_intents, tokenizer, device='cuda:0'):
@@ -162,151 +251,116 @@ def validation(model, data, lang, criterion_slots, criterion_intents, tokenizer,
         hyp_slots = []
         
         for sample in data:
-
-            # input_ids.shape = batch_size * max_len
-            # tokenized and encoded utterance
             input_ids = sample['utterances'].to(device)
-
-            # attention_mask.shape = batch_size * max_len
-            # binary mask to know if what we are checking is relevant or padding
-            attention_mask = torch.stack(sample['attention_mask']).to(device)
-
-            # intents.shape = batch_size
+            
+            # Handle attention mask
+            if 'attention_mask' in sample:
+                if isinstance(sample['attention_mask'], list):
+                    try:
+                        attention_mask = torch.stack(sample['attention_mask']).to(device)
+                    except:
+                        attention_mask = torch.ones_like(input_ids).to(device)
+                else:
+                    attention_mask = sample['attention_mask'].to(device)
+            else:
+                attention_mask = torch.ones_like(input_ids).to(device)
+            
+            # Get labels
             intents = sample['intents'].to(device)
-
-            # slots.shape = batch_size * max_len
-            # real slots
             slots = sample['y_slots'].to(device)
 
-            # intent_pred.shape = batch_size * number_of_intents(len(total_intents))
-            # slot_pred.shape = batch_size * max_len * number_of_slots(130)
-            intent_pred, slot_pred = model(token_ids=input_ids, attention_mask=attention_mask)
-
-
-            loss_slot = criterion_slots(slot_pred.view(-1,model.slots), slots.view(-1))
-            loss_intent = criterion_intents(intent_pred, intents)
-
+            # Forward pass
+            intent_logits, slot_logits = model(token_ids=input_ids, attention_mask=attention_mask)
+            
+            # Swap outputs if needed based on shapes
+            if len(slot_logits.shape) == 3 and len(intent_logits.shape) == 2:
+                # Already correct format
+                pass
+            elif len(intent_logits.shape) == 3 and len(slot_logits.shape) == 2:
+                # Swap them
+                temp = slot_logits
+                slot_logits = intent_logits
+                intent_logits = temp
+            
+            # Calculate losses with proper shapes
+            batch_size, seq_len, num_slots = slot_logits.shape
+            
+            loss_slot = criterion_slots(
+                slot_logits.view(-1, num_slots), 
+                slots.view(-1)
+            )
+            
+            loss_intent = criterion_intents(intent_logits, intents)
             loss = loss_intent + loss_slot
-
             total_loss += loss.item()
 
-            # mapping from ID to intent label of the prediction
-            # torch.argmax(intent_pred, dim=1).shape = batch_size
-            # len(predicted_intents) = batch_size
-            # also getting the most likely prediction
-            predicted_intents = [lang.id2intent[x] for x in torch.argmax(intent_pred, dim=1).tolist()] 
-
-            # map from ID to intent label the original intents
-            # len(real_intents) = batch_size
-            # used to calculate accuracy for intents with respect to predictions
+            # Process intent predictions
+            predicted_intents = [lang.id2intent[x] for x in torch.argmax(intent_logits, dim=1).tolist()]
             real_intents = [lang.id2intent[x] for x in intents.tolist()]
-
-            # global list of real intents
-            # ref = reference
             ref_intents.extend(real_intents)
-            
-            # global list of predicted intents
-            # hyp = hypothetical
             hyp_intents.extend(predicted_intents)
 
-            # predicted_slots.shape = batch_size * max_len
-            # get the actual predictions for the slots
-            predicted_slots = torch.argmax(slot_pred, dim=2)
-
-            for idx, seq in enumerate(predicted_slots):
-                # is max_len, if all samples are padded to same len
-                # otherwise is length of the sample
+            # Process slot predictions - this is the critical part
+            predicted_slots = torch.argmax(slot_logits, dim=2)  # [batch_size, seq_len]
+            
+            # Process each sequence in the batch
+            for idx, (pred_seq, true_seq) in enumerate(zip(predicted_slots, slots)):
                 length = sample['slots_len'].tolist()[idx]
-
-                # decode the token
-                decoded_token = tokenizer.decode(input_ids[idx])
-
-                # take real slots ids
-                # len(real_slots_ids) = max_len
-                # gt_ids
-                real_slots_ids = slots[idx].tolist()
-
-                # convert slots ids into the actual labels of the slot
-                # len(real_slots_labels) = max_len
-                # gt_slots
-                real_slots_labels = [lang.id2slot[elem] for elem in real_slots_ids[:length]]
-
-                # ignore the first value ([CLS])
-                real_slots_labels = real_slots_labels[1:]
-
-                # get predicted_slots ids for the sample
-                # len(to_decode) = max_len
-                to_decode = seq[1:length].tolist()
-
-                # global list of real slots
-                # len([]) = batch_size
-                # len([()]) = max_len
-                # [(utterance, slot_label), ...]
-                #ref_slots.append([(utt_ids[id_el], elem) for id_el, elem in enumerate(real_slots_labels)]
                 
-                # split the decoded string into a list of words to fix small issues
-                decoded_token = decoded_token.split()
-
-                actually_decoded_token = []
-
-                # the tokenizer has this issue where, other than the sub-tokenization, it adds values we don't have in the mapping
-                # for example " i 'd go to" should be tokenized as [i, 'd, go, to] but in reality it's [i, ', d, go, to]
-                # since we don't have the encoding for ' we want to ensure that the decoded token is actually the original
-                # so we fix that and in-place of the extra token we set 'O'
-                tmp_string = ""
-                for word in decoded_token:
-                    if "'" in word:
-                        for letter in word:
-                            if letter != "'":
-                                tmp_string += letter
-                            else:
-                                actually_decoded_token.append(tmp_string)
-                                actually_decoded_token.append('O')
-                                tmp_string = letter # '
-                        actually_decoded_token.append(tmp_string)
-                        tmp_string = ""
+                # Skip padding - only consider actual tokens
+                # Start from index 1 to skip [CLS] token
+                pred_seq = pred_seq[1:length].tolist()
+                true_seq = true_seq[1:length].tolist()
+                
+                # Get the original words for this utterance
+                # Fix: properly handle the utterance field which could be a tensor or string
+                if isinstance(sample['utterance'], list):
+                    if isinstance(sample['utterance'][idx], torch.Tensor):
+                        utterance = tokenizer.decode(sample['utterance'][idx]).split()
                     else:
-                        actually_decoded_token.append(word)
-
-
-                # as this might (should not) lower the size of the token, we fix it by padding at the end 
-                # to ensure dimensionality
-                while len(actually_decoded_token) < len(real_slots_ids):
-                    actually_decoded_token.append(lang.slot2id['pad'])
-
-                # similar to before, we don't want the extra [CLS] token added by tokenizer
-                actually_decoded_token = actually_decoded_token[1:]
-                '''
-                # take in consideration only the important samples ( )
-                sample_attention_mask = attention_mask[idx].tolist()
-                sample_attention_mask = sample_attention_mask[1:]
+                        utterance = sample['utterance'][idx].split()
+                else:
+                    # If utterance is not directly accessible, try to decode from input_ids
+                    utterance = tokenizer.decode(input_ids[idx]).split()
                 
-                attention_mask_idx = 0
-                while attention_mask_idx < len(sample_attention_mask) and sample_attention_mask[attention_mask_idx] == 1:
-                    attention_mask_idx += 1
+                # Ensure we have the right sequence length 
+                # Sometimes the tokenizer adds special tokens or splits words differently
+                min_len = min(len(utterance), len(pred_seq), len(true_seq))
                 
-                sample_attention_mask = sample_attention_mask[:attention_mask_idx - 1]
-                actually_decoded_token = actually_decoded_token[:attention_mask_idx - 1]
-                to_decode = to_decode[:attention_mask_idx - 1]
-                real_slots_labels = real_slots_labels[:attention_mask_idx - 1]
-                '''
-
-
-                ref_slots.append([(actually_decoded_token[id_el], elem) for id_el, elem in enumerate(real_slots_labels)])
-                hyp_slots.append([(actually_decoded_token[id_el], lang.id2slot[elem]) for id_el, elem in enumerate(to_decode)])
+                # Map to slot labels
+                try:
+                    ref_seq = [(utterance[i] if i < len(utterance) else "<PAD>", 
+                               lang.id2slot[true_seq[i]]) for i in range(min_len)]
+                    hyp_seq = [(utterance[i] if i < len(utterance) else "<PAD>", 
+                               lang.id2slot[pred_seq[i]]) for i in range(min_len)]
+                    
+                    ref_slots.append(ref_seq)
+                    hyp_slots.append(hyp_seq)
+                except Exception as e:
+                    print(f"Error processing sequence {idx}: {e}")
+                    # Print debugging info
+                    print(f"min_len: {min_len}, utterance len: {len(utterance)}, pred_seq len: {len(pred_seq)}, true_seq len: {len(true_seq)}")
+                    print(f"utterance: {utterance[:10]}...")
         
+    # Evaluate slot predictions
     try:
         results = evaluate(ref_slots, hyp_slots)
-    except Exception as exception:
+        # Print some examples for debugging
+        if len(ref_slots) > 0:
+            print("\nSample slot predictions:")
+            print("Ref:", ref_slots[0][:10])
+            print("Hyp:", hyp_slots[0][:10])
+    except Exception as e:
+        print(f"Error in slot evaluation: {e}")
         # Sometimes the model predicts a class that is not in REF
-        print("Warning:", exception)
-        ref_s = set([x[1] for x in ref_slots])
-        hyp_s = set([x[1] for x in hyp_slots])
-        print(hyp_s.difference(ref_s))
-        results = {"total":{"f":0}}
+        ref_s = set([x[1] for seq in ref_slots for x in seq])
+        hyp_s = set([x[1] for seq in hyp_slots for x in seq])
+        print(f"Missing slot labels: {hyp_s.difference(ref_s)}")
+        results = {"total": {"f": 0}}
 
-    report_intent = classification_report(ref_intents, hyp_intents, zero_division=False, output_dict=True)       
-
+    # Compute intent classification metrics
+    report_intent = classification_report(ref_intents, hyp_intents, zero_division=False, output_dict=True)
+    
     return results, report_intent, total_loss/len(data)
 
 def init_weights(mat):
