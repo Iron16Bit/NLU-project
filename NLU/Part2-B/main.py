@@ -90,7 +90,7 @@ if __name__ == "__main__":
         weights = weights / weights.mean()
 
         # Use weighted loss for slot classification
-        criterion_slots = nn.CrossEntropyLoss(weight=weights, ignore_index=PAD_TOKEN)
+        criterion_slots = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)  # Simpler approach
         criterion_intents = nn.CrossEntropyLoss()  # Because we do not have the pad token
 
         model_name = 'bert-base-uncased'
@@ -114,7 +114,12 @@ if __name__ == "__main__":
         print(f"Train loader size: {len(train_loader)}")
         print(f"Sample batch size: {next(iter(train_loader))['utterances'].shape}")
 
-        optimizer = optim.AdamW(model.parameters(), lr=lr)
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)  # Add weight decay
+
+        # Add a learning rate scheduler
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=2, verbose=True
+        )
 
         best_f1 = 0
         best_model = model
@@ -148,6 +153,9 @@ if __name__ == "__main__":
                 if current_patience <= 0:
                     print(f"Early stopping at epoch {epoch}")
                     break
+
+                # Update learning rate based on F1 score
+                scheduler.step(f1)
         
         print("\nEvaluating on test set...")
         best_model = best_model.to(device)
