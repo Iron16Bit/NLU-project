@@ -26,7 +26,7 @@ class LM_LSTM_wt(nn.Module):
         self.embedding = nn.Embedding(output_size, emb_size, padding_idx=pad_index)
         self.lstm = nn.LSTM(emb_size, hidden_size, n_layers, bidirectional=False, batch_first=True)
         self.pad_token = pad_index
-        self.output = nn.Linear(hidden_size, output_size)
+        self.output = nn.Linear(hidden_size, output_size, bias=False) 
         # Weight Tying - Use the same weights
         self.output.weight = self.embedding.weight
 
